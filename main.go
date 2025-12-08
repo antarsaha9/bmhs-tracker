@@ -3,10 +3,13 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,46 +17,51 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/marcboeker/go-duckdb/v2"
+	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 // Simple, single-binary Go server that ingests rrweb events from a Next.js frontend
 // and writes them into daily DuckDB partition files. It exposes endpoints:
-//  - POST /ingest  -> accept JSON { sessionId, userId, events: [ ... ] }
+//  - POST /ingest  -> accept JSON { sessionId, events: [ ... ] }
+//  - POST /record_user_session -> register user_id against session_id
 //  - GET  /replay?session=... -> stream NDJSON of events for given session
 //  - GET  /query_user?user=... -> return metadata/sessions for a user
 //
 // The design goals:
 //  - very fast inserts via frontend batching + a writer goroutine
 //  - daily DuckDB partitions: data/duck/events_YYYY_MM_DD.duckdb
-//  - simple metadata kept in-memory with optional persistence file (small footprint)
+//  - user-session mappings stored in separate table
+//  - queries database directly (no in-memory caching to avoid OOM)
 //  - authentication/authorization left as TODO (add JWT/API keys in production)
 
 const (
-	dataDir      = "./data"
-	duckDir      = dataDir + "/duck"
-	metadataFile = dataDir + "/meta.json" // optional small metadata persistence
+	dataDir = "./data"
+	duckDir = dataDir + "/duck"
 )
 
 // EventRow holds one rrweb event mapped to a DB row
 type EventRow struct {
 	Ts        time.Time `json:"ts"`
 	SessionID string    `json:"session_id"`
-	UserID    string    `json:"user_id"`
 	EventJSON string    `json:"event_json"`
 }
 
 // payload from frontend
 type IngestPayload struct {
 	SessionID string            `json:"sessionId"`
-	UserID    string            `json:"userId"`
 	Events    []json.RawMessage `json:"events"`
 }
 
-// simple in-memory metadata we persist on shutdown occasionally
-type SessionMeta struct {
+// payload for registering user against session
+type RegisterUserPayload struct {
 	SessionID string `json:"sessionId"`
 	UserID    string `json:"userId"`
+}
+
+// session metadata returned by queries
+type SessionMeta struct {
+	SessionID string `json:"sessionId"`
+	UserID    string `json:"userId,omitempty"`
 	FirstTS   int64  `json:"firstTs"`
 	LastTS    int64  `json:"lastTs"`
 	Size      int64  `json:"size"`
@@ -63,10 +71,6 @@ type SessionMeta struct {
 var (
 	// channel for batched ingestion; each item is a batch (slice) of EventRow
 	ingestCh = make(chan []EventRow, 512)
-
-	// simple metadata map
-	metaMu sync.RWMutex
-	meta   = map[string]*SessionMeta{} // sessionID -> meta
 
 	// waitgroup for background workers
 	wg sync.WaitGroup
@@ -78,14 +82,47 @@ func main() {
 		log.Fatalf("failed to create data dir: %v", err)
 	}
 
+	// initialize user-sessions database
+	userSessionsDB := filepath.Join(duckDir, "user_sessions.duckdb")
+	if err := initUserSessionsDB(userSessionsDB); err != nil {
+		log.Fatalf("failed to init user_sessions db: %v", err)
+	}
+
 	// start writer worker
 	wg.Add(1)
 	go writerWorker()
 
-	// HTTP handlers
-	http.HandleFunc("/ingest", ingestHandler)
-	http.HandleFunc("/replay", replayHandler)
-	http.HandleFunc("/query_user", queryUserHandler)
+	// CORS middleware
+	corsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			
+			// Handle preflight requests
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			
+			next(w, r)
+		}
+	}
+
+	// HTTP handlers with CORS
+	http.HandleFunc("/ingest", corsMiddleware(ingestHandler))
+	http.HandleFunc("/record_user_session", corsMiddleware(recordUserSessionHandler))
+	http.HandleFunc("/replay", corsMiddleware(replayHandler))
+	http.HandleFunc("/query_user", corsMiddleware(queryUserHandler))
+
+	// Serve HTML page
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			http.ServeFile(w, r, "index.html")
+		} else {
+			http.NotFound(w, r)
+		}
+	})
 
 	// basic health
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -103,24 +140,54 @@ func main() {
 	wg.Wait()
 }
 
-// ingestHandler accepts JSON payloads from the browser. It converts incoming
-// events into EventRow objects with the current timestamp and enqueues them
-// as a single batch on ingestCh. The handler returns quickly (202 Accepted)
-// so the frontend can continue.
-// Ingest handler: user_id may be empty (anonymous).
-// Once user signs in, new events include user_id, and session_id links anonymous+auth events.
+// ingestHandler accepts gzipped+base64 encoded JSON payloads from the browser.
+// It decompresses and decodes the payload, then converts incoming events into
+// EventRow objects with the current timestamp and enqueues them as a single batch
+// on ingestCh. The handler returns quickly (202 Accepted) so the frontend can continue.
+// Note: user_id is not included in ingest payload. Use /record_user_session to register user_id.
 func ingestHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var p IngestPayload
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(&p); err != nil {
-		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+	// Read the request body (base64 string)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request: failed to read body", http.StatusBadRequest)
 		return
 	}
+	defer r.Body.Close()
+
+	// Decode base64 (trim whitespace)
+	base64Str := string(bytes.TrimSpace(bodyBytes))
+	gzippedData, err := base64.StdEncoding.DecodeString(base64Str)
+	if err != nil {
+		http.Error(w, "bad request: invalid base64", http.StatusBadRequest)
+		return
+	}
+
+	// Decompress gzip
+	gzReader, err := gzip.NewReader(bytes.NewReader(gzippedData))
+	if err != nil {
+		http.Error(w, "bad request: invalid gzip data", http.StatusBadRequest)
+		return
+	}
+	defer gzReader.Close()
+
+	decompressedData, err := io.ReadAll(gzReader)
+	if err != nil {
+		http.Error(w, "bad request: failed to decompress", http.StatusBadRequest)
+		return
+	}
+
+	// Parse JSON
+	var p IngestPayload
+	if err := json.Unmarshal(decompressedData, &p); err != nil {
+		http.Error(w, "bad request: invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	if p.SessionID == "" {
 		http.Error(w, "missing sessionId", http.StatusBadRequest)
 		return
@@ -132,10 +199,12 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, EventRow{
 			Ts:        now,
 			SessionID: p.SessionID,
-			UserID:    p.UserID,
 			EventJSON: string(ev),
 		})
 	}
+
+	// Log the request
+	log.Printf("[POST /ingest] session_id=%s events=%d", p.SessionID, len(rows))
 
 	// enqueue batch (non-blocking). If full, return 429.
 	select {
@@ -144,8 +213,68 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("queued"))
 	default:
 		// queue full; reject or fall back to direct write (here: reject)
+		log.Printf("[POST /ingest] session_id=%s events=%d ERROR: queue full", p.SessionID, len(rows))
 		http.Error(w, "server busy", http.StatusTooManyRequests)
 	}
+}
+
+// recordUserSessionHandler registers a user_id against a session_id.
+func recordUserSessionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var p RegisterUserPayload
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&p); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if p.SessionID == "" {
+		http.Error(w, "missing sessionId", http.StatusBadRequest)
+		return
+	}
+	if p.UserID == "" {
+		http.Error(w, "missing userId", http.StatusBadRequest)
+		return
+	}
+
+	// Log the request
+	log.Printf("[POST /record_user_session] session_id=%s user_id=%s", p.SessionID, p.UserID)
+
+	// Insert or update in user_sessions table
+	userSessionsDB := filepath.Join(duckDir, "user_sessions.duckdb")
+	db, err := sql.Open("duckdb", userSessionsDB)
+	if err != nil {
+		log.Printf("[POST /record_user_session] session_id=%s user_id=%s ERROR: failed to open DB: %v", p.SessionID, p.UserID, err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer db.Close()
+
+	// Delete existing record if it exists, then insert new one
+	// _, err = db.Exec("DELETE FROM user_sessions WHERE session_id = ?", p.SessionID)
+	// if err != nil {
+	// 	log.Printf("[POST /record_user_session] session_id=%s user_id=%s ERROR: delete failed: %v", p.SessionID, p.UserID, err)
+	// }
+
+	now := time.Now().UTC()
+	_, err = db.Exec("INSERT INTO user_sessions (session_id, user_id, created_at) VALUES (?, ?, ?)",
+		p.SessionID, p.UserID, now.Format(time.RFC3339Nano))
+	if err != nil {
+		log.Printf("[POST /record_user_session] session_id=%s user_id=%s ERROR: insert failed: %v", p.SessionID, p.UserID, err)
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.Encode(map[string]interface{}{
+		"status":    "registered",
+		"sessionId": p.SessionID,
+		"userId":    p.UserID,
+	})
 }
 
 // writerWorker receives batches and writes them into the current day's DuckDB.
@@ -159,6 +288,11 @@ func writerWorker() {
 	var err error
 
 	for batch := range ingestCh {
+		// Log batch info (all events in batch have same session_id)
+		if len(batch) > 0 {
+			log.Printf("[writerWorker] inserting batch session_id=%s events=%d", batch[0].SessionID, len(batch))
+		}
+
 		// determine day for the batch (UTC date)
 		day := time.Now().UTC().Format("2006_01_02")
 		if db == nil || day != currentDay {
@@ -194,47 +328,53 @@ func writerWorker() {
 			log.Printf("begin tx err: %v", err)
 			continue
 		}
-		stmt, err := tx.Prepare("INSERT INTO events (ts, session_id, user_id, event) VALUES (?, ?, ?, ?)")
+		stmt, err := tx.Prepare("INSERT INTO events (ts, session_id, event) VALUES (?, ?, ?)")
 		if err != nil {
 			log.Printf("prepare err: %v", err)
 			tx.Rollback()
 			continue
 		}
 
-		var bytesWritten int64
 		for _, r := range batch {
-			_, err := stmt.Exec(r.Ts.Format(time.RFC3339Nano), r.SessionID, r.UserID, r.EventJSON)
+			_, err := stmt.Exec(r.Ts.Format(time.RFC3339Nano), r.SessionID, r.EventJSON)
 			if err != nil {
 				log.Printf("insert err: %v", err)
 				// continue inserting remaining rows
 				continue
 			}
-			bytesWritten += int64(len(r.EventJSON))
-
-			// update in-memory metadata
-			metaMu.Lock()
-			m := meta[r.SessionID]
-			if m == nil {
-				m = &SessionMeta{SessionID: r.SessionID, UserID: r.UserID, FirstTS: r.Ts.UnixMilli(), File: filepath.Base(dbStatsPath(currentDay))}
-				meta[r.SessionID] = m
-			}
-			if m.FirstTS == 0 || r.Ts.UnixMilli() < m.FirstTS {
-				m.FirstTS = r.Ts.UnixMilli()
-			}
-			m.LastTS = r.Ts.UnixMilli()
-			m.Size += int64(len(r.EventJSON))
-			metaMu.Unlock()
 		}
 
 		stmt.Close()
-		tx.Commit()
+		if err := tx.Commit(); err != nil {
+			if len(batch) > 0 {
+				log.Printf("[writerWorker] session_id=%s events=%d ERROR: commit failed: %v", batch[0].SessionID, len(batch), err)
+			}
+			continue
+		}
 
-		// optionally persist metadata periodically; omitted here for simplicity
+		// Log successful insert
+		if len(batch) > 0 {
+			log.Printf("[writerWorker] inserted batch session_id=%s events=%d", batch[0].SessionID, len(batch))
+		}
 	}
 }
 
-func dbStatsPath(day string) string {
-	return filepath.Join(duckDir, fmt.Sprintf("events_%s.duckdb", day))
+
+func initUserSessionsDB(dbPath string) error {
+	db, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+	CREATE TABLE IF NOT EXISTS user_sessions (
+		session_id VARCHAR PRIMARY KEY,
+		user_id VARCHAR,
+		created_at TIMESTAMP
+	);
+	`)
+	return err
 }
 
 func ensureTable(db *sql.DB) error {
@@ -244,7 +384,6 @@ func ensureTable(db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS events (
 		ts TIMESTAMP,
 		session_id VARCHAR,
-		user_id VARCHAR,
 		event TEXT
 	);
 	`)
@@ -253,14 +392,14 @@ func ensureTable(db *sql.DB) error {
 
 // replayHandler streams events for a session ordered by ts as NDJSON. To keep
 // the implementation simple, we search across all daily files in data/duck.
-// A production server could use the in-memory metadata map to limit which files
-// to query.
 func replayHandler(w http.ResponseWriter, r *http.Request) {
 	s := r.URL.Query().Get("session")
 	if s == "" {
 		http.Error(w, "missing session", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[GET /replay] session_id=%s", s)
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
@@ -297,8 +436,7 @@ func replayHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// queryUserHandler returns metadata for sessions for a given user. We look up
-// the in-memory meta map and return any sessions where UserID matches.
+// queryUserHandler returns metadata for sessions for a given user by querying the database directly.
 func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 	user := r.URL.Query().Get("user")
 	if user == "" {
@@ -306,61 +444,151 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := make([]*SessionMeta, 0)
-	metaMu.RLock()
-	for _, m := range meta {
-		if m.UserID == user {
-			out = append(out, m)
+	log.Printf("[GET /query_user] user_id=%s", user)
+
+	// Get all session_ids for this user from user_sessions table
+	sessionIDs := make(map[string]bool)
+	sessionToUser := make(map[string]string) // session_id -> user_id mapping
+	userSessionsDB := filepath.Join(duckDir, "user_sessions.duckdb")
+	db, err := sql.Open("duckdb", userSessionsDB)
+	if err == nil {
+		rows, err := db.Query("SELECT session_id, user_id FROM user_sessions WHERE user_id = ?", user)
+		if err == nil {
+			for rows.Next() {
+				var sessionID, userID string
+				if err := rows.Scan(&sessionID, &userID); err == nil {
+					sessionIDs[sessionID] = true
+					sessionToUser[sessionID] = userID
+				}
+			}
+			rows.Close()
 		}
+		db.Close()
 	}
-	metaMu.RUnlock()
+
+	if len(sessionIDs) == 0 {
+		log.Printf("[GET /query_user] user_id=%s no sessions found", user)
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.Encode([]*SessionMeta{})
+		return
+	}
+
+	// Query database directly for session metadata
+	files, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	sessionMeta := make(map[string]*SessionMeta)
+
+	// Build placeholders for IN clause
+	sessionIDList := make([]interface{}, 0, len(sessionIDs))
+	for sid := range sessionIDs {
+		sessionIDList = append(sessionIDList, sid)
+	}
+
+	for _, f := range files {
+		db, err := sql.Open("duckdb", f)
+		if err != nil {
+			log.Printf("open %s err: %v", f, err)
+			continue
+		}
+
+		// Build query with IN clause
+		placeholders := ""
+		for i := 0; i < len(sessionIDList); i++ {
+			if i > 0 {
+				placeholders += ","
+			}
+			placeholders += "?"
+		}
+
+		query := fmt.Sprintf(`
+			SELECT 
+				session_id,
+				MIN(ts) as first_ts,
+				MAX(ts) as last_ts,
+				COUNT(*) as event_count,
+				SUM(LENGTH(event)) as total_size
+			FROM events 
+			WHERE session_id IN (%s)
+			GROUP BY session_id
+		`, placeholders)
+
+		rows, err := db.Query(query, sessionIDList...)
+		if err != nil {
+			log.Printf("query err: %v", err)
+			db.Close()
+			continue
+		}
+
+		for rows.Next() {
+			var sessionID string
+			var firstTS, lastTS sql.NullTime
+			var eventCount int64
+			var totalSize sql.NullInt64
+
+			if err := rows.Scan(&sessionID, &firstTS, &lastTS, &eventCount, &totalSize); err != nil {
+				continue
+			}
+
+			if existing, ok := sessionMeta[sessionID]; ok {
+				// Update with earliest firstTs and latest lastTs across files
+				// Preserve userId if not set
+				if existing.UserID == "" && sessionToUser[sessionID] != "" {
+					existing.UserID = sessionToUser[sessionID]
+				}
+				if firstTS.Valid {
+					firstTSMs := firstTS.Time.UnixMilli()
+					if existing.FirstTS == 0 || firstTSMs < existing.FirstTS {
+						existing.FirstTS = firstTSMs
+					}
+				}
+				if lastTS.Valid {
+					lastTSMs := lastTS.Time.UnixMilli()
+					if lastTSMs > existing.LastTS {
+						existing.LastTS = lastTSMs
+					}
+				}
+				if totalSize.Valid {
+					existing.Size += totalSize.Int64
+				}
+			} else {
+				// Create new entry
+				meta := &SessionMeta{
+					SessionID: sessionID,
+					UserID:    sessionToUser[sessionID], // Add user_id from mapping
+					File:      filepath.Base(f),
+				}
+				if firstTS.Valid {
+					meta.FirstTS = firstTS.Time.UnixMilli()
+				}
+				if lastTS.Valid {
+					meta.LastTS = lastTS.Time.UnixMilli()
+				}
+				if totalSize.Valid {
+					meta.Size = totalSize.Int64
+				}
+				sessionMeta[sessionID] = meta
+			}
+		}
+		rows.Close()
+		db.Close()
+	}
+
+	// Convert map to slice
+	out := make([]*SessionMeta, 0, len(sessionMeta))
+	for _, m := range sessionMeta {
+		out = append(out, m)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.Encode(out)
 }
 
-// --- Utility (not used in all flows) ---
-
-// For clarity, add a helper to read persisted metadata from disk (optional)
-func loadMetaFromDisk() error {
-	f, err := os.Open(metadataFile)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-	var mlist []*SessionMeta
-	if err := json.NewDecoder(f).Decode(&mlist); err != nil {
-		return err
-	}
-	metaMu.Lock()
-	for _, m := range mlist {
-		meta[m.SessionID] = m
-	}
-	metaMu.Unlock()
-	return nil
-}
-
-// persist metadata (call occasionally or on shutdown)
-func persistMetaToDisk() error {
-	metaMu.RLock()
-	out := make([]*SessionMeta, 0, len(meta))
-	for _, m := range meta {
-		out = append(out, m)
-	}
-	metaMu.RUnlock()
-	f, err := os.Create(metadataFile)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
-}
 
 
 // File: go.mod
@@ -400,12 +628,15 @@ rrweb-duckdb-go-server
 Quickstart:
   - Build: go build -o rrweb-duckdb-server
   - Run:   ./rrweb-duckdb-server
-  - Ingest: POST /ingest with JSON { sessionId, userId, events: [...] }
+  - Ingest: POST /ingest with JSON { sessionId, events: [...] }
+  - Register user: POST /record_user_session with JSON { sessionId, userId }
   - Replay: GET /replay?session=<sessionId>  (returns NDJSON)
+  - Query user: GET /query_user?user=<userId>
 
 Notes:
   - This is a minimal boilerplate. Add TLS, auth, request validation, metrics, and
     graceful shutdown before productionizing.
   - Tune ingestCh buffer size, batch sizes, and how you determine ts per-event.
   - Consider using hourly partitions if daily files become too large.
+  - User-session mappings stored in separate table to avoid storing user_id in events.
 */
