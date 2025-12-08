@@ -6,6 +6,8 @@
     <title>Session Tracker - Replay</title>
     <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
         <script src="https://unpkg.com/@rrweb/rrweb-plugin-console-replay@2.0.0-alpha.15"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/style.css" />
+    <script src="https://unpkg.com/rrweb-player@latest"></script>
     <style>
         * {
             margin: 0;
@@ -43,12 +45,18 @@
             margin-bottom: 15px;
         }
         
-        input[type="text"] {
+        input[type="text"],
+        select {
             flex: 1;
             padding: 10px;
             border: 1px solid #ddd;
             border-radius: 4px;
             font-size: 14px;
+        }
+        
+        select {
+            flex: 0 0 auto;
+            min-width: 150px;
         }
         
         button {
@@ -129,17 +137,6 @@
             margin-bottom: 15px;
         }
         
-        .replay-controls {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-        
-        .replay-controls button {
-            padding: 8px 16px;
-            font-size: 12px;
-        }
-        
         .close-btn {
             background: #dc3545;
         }
@@ -153,7 +150,20 @@
             border-radius: 4px;
             overflow: hidden;
             background: white;
+            min-height: 400px;
         }
+
+        /* Override rrweb-player default wrapper positioning so it fills the container */
+        /* #replay-container .replayer-wrapper {
+            position: relative;
+            left: 0;
+            top: 0;
+            float: none;
+            clear: none;
+            transform-origin: top left;
+            transform: none;
+            width: 100%;
+        } */
         
         .loading {
             text-align: center;
@@ -211,11 +221,7 @@
         <div class="replay-section" id="replaySection">
             <div class="replay-header">
                 <h2>Replay Session: <span id="replaySessionId"></span></h2>
-                <div class="replay-controls">
-                    <button onclick="toggleReplay()" id="playPauseBtn">Play</button>
-                    <button onclick="resetReplay()">Reset</button>
-                    <button class="close-btn" onclick="closeReplay()">Close</button>
-                </div>
+                <button class="close-btn" onclick="closeReplay()">Close</button>
             </div>
             <div id="replay-container"></div>
         </div>
@@ -224,8 +230,7 @@
     <script>
         const API_BASE = window.location.origin;
         let replayEvents = [];
-        let replayInstance = null;
-        let isPlaying = false;
+        let playerInstance = null;
 
         async function searchSessions() {
             const userId = document.getElementById('userIdInput').value.trim();
@@ -354,57 +359,102 @@
             const replayContainer = document.getElementById('replay-container');
             replayContainer.innerHTML = '';
             
-            replayInstance = new rrweb.Replayer(replayEvents, {
-                root: replayContainer,
-                speed: 1,
-                plugins: [
-                    // Replay console logs captured by rrweb sessions
-                    window.rrwebPluginConsoleReplay && window.rrwebPluginConsoleReplay.getReplayConsolePlugin
-                        ? window.rrwebPluginConsoleReplay.getReplayConsolePlugin({
-                            level: ['info', 'log', 'warn', 'error'],
-                        })
-                        : undefined,
-                ].filter(Boolean),
-            });
-            
-            replayInstance.play();
-            isPlaying = true;
-            updatePlayPauseButton();
-        }
-
-        function toggleReplay() {
-            if (!replayInstance) return;
-            
-            if (isPlaying) {
-                replayInstance.pause();
-                isPlaying = false;
-            } else {
-                replayInstance.play();
-                isPlaying = true;
+            // Clean up previous player instance if exists
+            if (playerInstance) {
+                if (playerInstance.$destroy && typeof playerInstance.$destroy === 'function') {
+                    playerInstance.$destroy();
+                } else if (playerInstance.pause && typeof playerInstance.pause === 'function') {
+                    playerInstance.pause();
+                }
+                playerInstance = null;
             }
-            updatePlayPauseButton();
+            
+            // Initialize console replay plugin
+            // Check for plugin availability (may be exposed as rrwebConsole or rrwebPluginConsoleReplay)
+            const consolePlugin = (window.rrwebConsole && window.rrwebConsole.getReplayConsolePlugin) 
+                ? window.rrwebConsole.getReplayConsolePlugin({
+                    level: ['info', 'log', 'warn', 'error'],
+                })
+                : (window.rrwebPluginConsoleReplay && window.rrwebPluginConsoleReplay.getReplayConsolePlugin)
+                ? window.rrwebPluginConsoleReplay.getReplayConsolePlugin({
+                    level: ['info', 'log', 'warn', 'error'],
+                })
+                : null;
+            
+            // Initialize rrweb-player with console plugin
+            const plugins = consolePlugin ? [consolePlugin] : [];
+            
+            // Calculate container width (account for padding and borders)
+            const containerWidth = Math.max(replayContainer.offsetWidth || replayContainer.clientWidth || 1024, 800);
+            
+            // Create rrweb-player instance
+            // Check for rrwebPlayer (Svelte component) or fallback to basic replayer
+            if (typeof rrwebPlayer !== 'undefined' && typeof window.rrwebPlayer !== 'undefined') {
+                try {
+                    playerInstance = new window.rrwebPlayer({
+                        target: replayContainer,
+                        props: {
+                            events: replayEvents,
+                            width: containerWidth,
+                            height: 576,
+                            autoPlay: false,
+                            showController: true,
+                            speedOption: [1, 2, 4, 8],
+                            plugins: plugins,
+                        },
+                    });
+                } catch (e) {
+                    console.warn('Error initializing rrweb-player:', e);
+                    // Fallback to basic replayer
+                    initBasicReplayer(replayContainer, plugins);
+                }
+            } else if (typeof rrwebPlayer !== 'undefined') {
+                try {
+                    playerInstance = new rrwebPlayer({
+                        target: replayContainer,
+                        props: {
+                            events: replayEvents,
+                            width: containerWidth,
+                            height: 576,
+                            autoPlay: false,
+                            showController: true,
+                            speedOption: [1, 2, 4, 8],
+                            plugins: plugins,
+                        },
+                    });
+                } catch (e) {
+                    console.warn('Error initializing rrweb-player:', e);
+                    initBasicReplayer(replayContainer, plugins);
+                }
+            } else {
+                // Fallback to basic replayer if rrweb-player is not available
+                console.warn('rrweb-player not found, falling back to basic replayer');
+                initBasicReplayer(replayContainer, plugins);
+            }
         }
-
-        function resetReplay() {
-            if (!replayInstance) return;
-            replayInstance.pause();
-            replayInstance = null;
-            startReplay();
+        
+        function initBasicReplayer(container, plugins) {
+            playerInstance = new rrweb.Replayer(replayEvents, {
+                root: container,
+                speed: 1,
+                plugins: plugins,
+            });
+            playerInstance.play();
         }
 
         function closeReplay() {
-            if (replayInstance) {
-                replayInstance.pause();
-                replayInstance = null;
+            if (playerInstance) {
+                // Destroy Svelte component if it's rrweb-player
+                if (playerInstance.$destroy && typeof playerInstance.$destroy === 'function') {
+                    playerInstance.$destroy();
+                } else if (playerInstance.pause && typeof playerInstance.pause === 'function') {
+                    // Fallback for basic replayer
+                    playerInstance.pause();
+                }
+                playerInstance = null;
             }
             document.getElementById('replaySection').classList.remove('active');
             replayEvents = [];
-            isPlaying = false;
-        }
-
-        function updatePlayPauseButton() {
-            const btn = document.getElementById('playPauseBtn');
-            btn.textContent = isPlaying ? 'Pause' : 'Play';
         }
 
         function clearSearch() {
