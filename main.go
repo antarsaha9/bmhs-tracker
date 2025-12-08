@@ -22,8 +22,8 @@ import (
 
 // Simple, single-binary Go server that ingests rrweb events from a Next.js frontend
 // and writes them into daily DuckDB partition files. It exposes endpoints:
-//  - POST /ingest  -> accept JSON { sessionId, events: [ ... ] }
-//  - POST /record_user_session -> register user_id against session_id
+//  - POST /ingest  -> accept JSON { sessionId, appType, events: [ ... ] }
+//  - POST /record_user_session -> register user_id against session_id & app_type
 //  - GET  /replay?session=... -> stream NDJSON of events for given session
 //  - GET  /query_user?user=... -> return metadata/sessions for a user
 //
@@ -43,18 +43,21 @@ const (
 type EventRow struct {
 	Ts        time.Time `json:"ts"`
 	SessionID string    `json:"session_id"`
+	AppType   string    `json:"app_type"`
 	EventJSON string    `json:"event_json"`
 }
 
 // payload from frontend
 type IngestPayload struct {
 	SessionID string            `json:"sessionId"`
+	AppType   string            `json:"appType"`
 	Events    []json.RawMessage `json:"events"`
 }
 
 // payload for registering user against session
 type RegisterUserPayload struct {
 	SessionID string `json:"sessionId"`
+	AppType   string `json:"appType"`
 	UserID    string `json:"userId"`
 }
 
@@ -62,6 +65,7 @@ type RegisterUserPayload struct {
 type SessionMeta struct {
 	SessionID string `json:"sessionId"`
 	UserID    string `json:"userId,omitempty"`
+	AppType   string `json:"appType,omitempty"`
 	FirstTS   int64  `json:"firstTs"`
 	LastTS    int64  `json:"lastTs"`
 	Size      int64  `json:"size"`
@@ -192,6 +196,10 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing sessionId", http.StatusBadRequest)
 		return
 	}
+	if p.AppType == "" {
+		http.Error(w, "missing appType", http.StatusBadRequest)
+		return
+	}
 
 	now := time.Now().UTC()
 	rows := make([]EventRow, 0, len(p.Events))
@@ -199,12 +207,13 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, EventRow{
 			Ts:        now,
 			SessionID: p.SessionID,
+			AppType:   p.AppType,
 			EventJSON: string(ev),
 		})
 	}
 
 	// Log the request
-	log.Printf("[POST /ingest] session_id=%s events=%d", p.SessionID, len(rows))
+	log.Printf("[POST /ingest] session_id=%s app_type=%s events=%d", p.SessionID, p.AppType, len(rows))
 
 	// enqueue batch (non-blocking). If full, return 429.
 	select {
@@ -235,13 +244,17 @@ func recordUserSessionHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing sessionId", http.StatusBadRequest)
 		return
 	}
+	if p.AppType == "" {
+		http.Error(w, "missing appType", http.StatusBadRequest)
+		return
+	}
 	if p.UserID == "" {
 		http.Error(w, "missing userId", http.StatusBadRequest)
 		return
 	}
 
 	// Log the request
-	log.Printf("[POST /record_user_session] session_id=%s user_id=%s", p.SessionID, p.UserID)
+	log.Printf("[POST /record_user_session] session_id=%s app_type=%s user_id=%s", p.SessionID, p.AppType, p.UserID)
 
 	// Insert or update in user_sessions table
 	userSessionsDB := filepath.Join(duckDir, "user_sessions.duckdb")
@@ -260,8 +273,8 @@ func recordUserSessionHandler(w http.ResponseWriter, r *http.Request) {
 	// }
 
 	now := time.Now().UTC()
-	_, err = db.Exec("INSERT INTO user_sessions (session_id, user_id, created_at) VALUES (?, ?, ?)",
-		p.SessionID, p.UserID, now.Format(time.RFC3339Nano))
+	_, err = db.Exec("INSERT INTO user_sessions (session_id, app_type, user_id, created_at) VALUES (?, ?, ?, ?)",
+		p.SessionID, p.AppType, p.UserID, now.Format(time.RFC3339Nano))
 	if err != nil {
 		log.Printf("[POST /record_user_session] session_id=%s user_id=%s ERROR: insert failed: %v", p.SessionID, p.UserID, err)
 		http.Error(w, "server error", http.StatusInternalServerError)
@@ -273,6 +286,7 @@ func recordUserSessionHandler(w http.ResponseWriter, r *http.Request) {
 	enc.Encode(map[string]interface{}{
 		"status":    "registered",
 		"sessionId": p.SessionID,
+		"appType":   p.AppType,
 		"userId":    p.UserID,
 	})
 }
@@ -290,7 +304,7 @@ func writerWorker() {
 	for batch := range ingestCh {
 		// Log batch info (all events in batch have same session_id)
 		if len(batch) > 0 {
-			log.Printf("[writerWorker] inserting batch session_id=%s events=%d", batch[0].SessionID, len(batch))
+			log.Printf("[writerWorker] inserting batch session_id=%s app_type=%s events=%d", batch[0].SessionID, batch[0].AppType, len(batch))
 		}
 
 		// determine day for the batch (UTC date)
@@ -328,7 +342,7 @@ func writerWorker() {
 			log.Printf("begin tx err: %v", err)
 			continue
 		}
-		stmt, err := tx.Prepare("INSERT INTO events (ts, session_id, event) VALUES (?, ?, ?)")
+		stmt, err := tx.Prepare("INSERT INTO events (ts, session_id, app_type, event) VALUES (?, ?, ?, ?)")
 		if err != nil {
 			log.Printf("prepare err: %v", err)
 			tx.Rollback()
@@ -336,7 +350,7 @@ func writerWorker() {
 		}
 
 		for _, r := range batch {
-			_, err := stmt.Exec(r.Ts.Format(time.RFC3339Nano), r.SessionID, r.EventJSON)
+			_, err := stmt.Exec(r.Ts.Format(time.RFC3339Nano), r.SessionID, r.AppType, r.EventJSON)
 			if err != nil {
 				log.Printf("insert err: %v", err)
 				// continue inserting remaining rows
@@ -354,7 +368,7 @@ func writerWorker() {
 
 		// Log successful insert
 		if len(batch) > 0 {
-			log.Printf("[writerWorker] inserted batch session_id=%s events=%d", batch[0].SessionID, len(batch))
+			log.Printf("[writerWorker] inserted batch session_id=%s app_type=%s events=%d", batch[0].SessionID, batch[0].AppType, len(batch))
 		}
 	}
 }
@@ -369,12 +383,18 @@ func initUserSessionsDB(dbPath string) error {
 
 	_, err = db.Exec(`
 	CREATE TABLE IF NOT EXISTS user_sessions (
-		session_id VARCHAR PRIMARY KEY,
+		session_id VARCHAR,
+		app_type VARCHAR,
 		user_id VARCHAR,
-		created_at TIMESTAMP
+		created_at TIMESTAMP,
+		PRIMARY KEY (session_id, app_type)
 	);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	_, _ = db.Exec(`ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS app_type VARCHAR;`)
+	return nil
 }
 
 func ensureTable(db *sql.DB) error {
@@ -384,22 +404,32 @@ func ensureTable(db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS events (
 		ts TIMESTAMP,
 		session_id VARCHAR,
+		app_type VARCHAR,
 		event TEXT
 	);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN IF NOT EXISTS app_type VARCHAR;`)
+	return nil
 }
 
 // replayHandler streams events for a session ordered by ts as NDJSON. To keep
 // the implementation simple, we search across all daily files in data/duck.
 func replayHandler(w http.ResponseWriter, r *http.Request) {
 	s := r.URL.Query().Get("session")
+	app := r.URL.Query().Get("app")
 	if s == "" {
 		http.Error(w, "missing session", http.StatusBadRequest)
 		return
 	}
+	if app == "" {
+		http.Error(w, "missing app", http.StatusBadRequest)
+		return
+	}
 
-	log.Printf("[GET /replay] session_id=%s", s)
+	log.Printf("[GET /replay] session_id=%s app_type=%s", s, app)
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
@@ -417,7 +447,7 @@ func replayHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("open %s err: %v", f, err)
 			continue
 		}
-		rows, err := db.Query("SELECT event FROM events WHERE session_id = ? ORDER BY ts", s)
+		rows, err := db.Query("SELECT event FROM events WHERE session_id = ? AND app_type = ? ORDER BY ts", s, app)
 		if err != nil {
 			// no table or other error
 			db.Close()
@@ -439,12 +469,17 @@ func replayHandler(w http.ResponseWriter, r *http.Request) {
 // queryUserHandler returns metadata for sessions for a given user by querying the database directly.
 func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 	user := r.URL.Query().Get("user")
+	app := r.URL.Query().Get("app")
 	if user == "" {
 		http.Error(w, "missing user", http.StatusBadRequest)
 		return
 	}
+	if app == "" {
+		http.Error(w, "missing app", http.StatusBadRequest)
+		return
+	}
 
-	log.Printf("[GET /query_user] user_id=%s", user)
+	log.Printf("[GET /query_user] user_id=%s app_type=%s", user, app)
 
 	// Get all session_ids for this user from user_sessions table
 	sessionIDs := make(map[string]bool)
@@ -452,7 +487,7 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 	userSessionsDB := filepath.Join(duckDir, "user_sessions.duckdb")
 	db, err := sql.Open("duckdb", userSessionsDB)
 	if err == nil {
-		rows, err := db.Query("SELECT session_id, user_id FROM user_sessions WHERE user_id = ?", user)
+		rows, err := db.Query("SELECT session_id, user_id FROM user_sessions WHERE user_id = ? AND app_type = ?", user, app)
 		if err == nil {
 			for rows.Next() {
 				var sessionID, userID string
@@ -513,11 +548,12 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 				COUNT(*) as event_count,
 				SUM(LENGTH(event)) as total_size
 			FROM events 
-			WHERE session_id IN (%s)
+			WHERE session_id IN (%s) AND app_type = ?
 			GROUP BY session_id
 		`, placeholders)
 
-		rows, err := db.Query(query, sessionIDList...)
+		args := append(sessionIDList, app)
+		rows, err := db.Query(query, args...)
 		if err != nil {
 			log.Printf("query err: %v", err)
 			db.Close()
@@ -559,6 +595,7 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 				// Create new entry
 				meta := &SessionMeta{
 					SessionID: sessionID,
+					AppType:   app,
 					UserID:    sessionToUser[sessionID], // Add user_id from mapping
 					File:      filepath.Base(f),
 				}
@@ -628,10 +665,10 @@ rrweb-duckdb-go-server
 Quickstart:
   - Build: go build -o rrweb-duckdb-server
   - Run:   ./rrweb-duckdb-server
-  - Ingest: POST /ingest with JSON { sessionId, events: [...] }
-  - Register user: POST /record_user_session with JSON { sessionId, userId }
-  - Replay: GET /replay?session=<sessionId>  (returns NDJSON)
-  - Query user: GET /query_user?user=<userId>
+  - Ingest: POST /ingest with JSON { sessionId, appType, events: [...] }
+  - Register user: POST /record_user_session with JSON { sessionId, appType, userId }
+  - Replay: GET /replay?session=<sessionId>&app=<appType>  (returns NDJSON)
+  - Query user: GET /query_user?user=<userId>&app=<appType>
 
 Notes:
   - This is a minimal boilerplate. Add TLS, auth, request validation, metrics, and

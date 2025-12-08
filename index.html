@@ -188,6 +188,12 @@
             <h2>Search Sessions by User ID</h2>
             <div class="search-box">
                 <input type="text" id="userIdInput" placeholder="Enter user ID to search sessions...">
+                <select id="appTypeSelect">
+                    <option value="">Select app type</option>
+                    <option value="host">host</option>
+                    <option value="guest">guest</option>
+                    <option value="admin">admin</option>
+                </select>
                 <button onclick="searchSessions()">Search</button>
                 <button onclick="clearSearch()">Clear</button>
             </div>
@@ -222,6 +228,7 @@
 
         async function searchSessions() {
             const userId = document.getElementById('userIdInput').value.trim();
+            const appType = document.getElementById('appTypeSelect').value;
             const errorDiv = document.getElementById('errorMessage');
             const container = document.getElementById('sessionsContainer');
             
@@ -231,11 +238,15 @@
                 errorDiv.innerHTML = '<div class="error">Please enter a user ID</div>';
                 return;
             }
+            if (!appType) {
+                errorDiv.innerHTML = '<div class="error">Please select an app type</div>';
+                return;
+            }
             
             container.innerHTML = '<div class="loading">Loading sessions...</div>';
             
             try {
-                const response = await fetch(`${API_BASE}/query_user?user=${encodeURIComponent(userId)}`);
+                const response = await fetch(`${API_BASE}/query_user?user=${encodeURIComponent(userId)}&app=${encodeURIComponent(appType)}`);
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
@@ -261,6 +272,7 @@
                     <thead>
                         <tr>
                             <th>Session ID</th>
+                            <th>App Type</th>
                             <th>User ID</th>
                             <th>First Event</th>
                             <th>Last Event</th>
@@ -280,13 +292,14 @@
                 html += `
                     <tr>
                         <td>${session.sessionId}</td>
+                        <td>${session.appType || '-'}</td>
                         <td>${session.userId || '<span style="color: #999;">N/A</span>'}</td>
                         <td><span class="timestamp">${firstTs}</span></td>
                         <td><span class="timestamp">${lastTs}</span></td>
                         <td>${sizeKB} KB</td>
                         <td>${session.file}</td>
                         <td>
-                            <button class="replay-btn" onclick="replaySession('${session.sessionId}')">Replay</button>
+                            <button class="replay-btn" onclick="replaySession('${session.sessionId}', '${session.appType || ''}')">Replay</button>
                         </td>
                     </tr>
                 `;
@@ -300,17 +313,23 @@
             container.innerHTML = html;
         }
 
-        async function replaySession(sessionId) {
+        async function replaySession(sessionId, appTypeFromRow) {
             const replaySection = document.getElementById('replaySection');
             const replayContainer = document.getElementById('replay-container');
             const replaySessionIdSpan = document.getElementById('replaySessionId');
+            const appType = appTypeFromRow || document.getElementById('appTypeSelect').value;
             
             replaySection.classList.add('active');
             replaySessionIdSpan.textContent = sessionId;
             replayContainer.innerHTML = '<div class="loading">Loading events...</div>';
             
+            if (!appType) {
+                replayContainer.innerHTML = '<div class="error">Missing app type for this session</div>';
+                return;
+            }
+            
             try {
-                const response = await fetch(`${API_BASE}/replay?session=${encodeURIComponent(sessionId)}`);
+                const response = await fetch(`${API_BASE}/replay?session=${encodeURIComponent(sessionId)}&app=${encodeURIComponent(appType)}`);
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
@@ -381,6 +400,7 @@
 
         function clearSearch() {
             document.getElementById('userIdInput').value = '';
+            document.getElementById('appTypeSelect').value = '';
             document.getElementById('errorMessage').innerHTML = '';
             document.getElementById('sessionsContainer').innerHTML = '<div class="no-sessions">Enter a user ID and click Search to find sessions</div>';
         }
