@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Session Tracker - Replay</title>
     <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@rrweb/rrweb-plugin-console-replay@latest/dist/index.umd.js"></script>
     <style>
         * {
             margin: 0;
@@ -356,6 +357,14 @@
             replayInstance = new rrweb.Replayer(replayEvents, {
                 root: replayContainer,
                 speed: 1,
+                plugins: [
+                    // Replay console logs captured by rrweb sessions
+                    window.rrwebConsole && window.rrwebConsole.getReplayConsolePlugin
+                        ? window.rrwebConsole.getReplayConsolePlugin({
+                            level: ['info', 'log', 'warn', 'error'],
+                        })
+                        : undefined,
+                ].filter(Boolean),
             });
             
             replayInstance.play();
