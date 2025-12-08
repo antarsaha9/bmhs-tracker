@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -13,8 +14,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -102,13 +105,13 @@ func main() {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			
+
 			// Handle preflight requests
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			
+
 			next(w, r)
 		}
 	}
@@ -134,14 +137,42 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	addr := ":8080"
-	log.Printf("listening %s\n", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatalf("http server failed: %v", err)
+	// Create HTTP server with graceful shutdown support
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: nil,
 	}
 
-	// wait for background tasks if server lifts graceful shutdown (not implemented here)
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Start server in a goroutine
+	go func() {
+		log.Printf("listening %s\n", server.Addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("http server failed: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-sigChan
+	log.Println("shutting down gracefully...")
+
+	// Shutdown HTTP server with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("server shutdown error: %v", err)
+	}
+
+	// Close ingest channel to signal writerWorker to stop
+	close(ingestCh)
+	log.Println("waiting for writer worker to finish...")
+
+	// Wait for background tasks to complete
 	wg.Wait()
+	log.Println("shutdown complete")
 }
 
 // ingestHandler accepts gzipped+base64 encoded JSON payloads from the browser.
@@ -294,6 +325,8 @@ func recordUserSessionHandler(w http.ResponseWriter, r *http.Request) {
 // writerWorker receives batches and writes them into the current day's DuckDB.
 // It opens/closes the daily DB as the day changes. Each batch is inserted
 // inside a transaction for speed.
+// When ingestCh is closed, it will exit after processing remaining batches
+// and properly closing the database connection.
 func writerWorker() {
 	defer wg.Done()
 
@@ -371,8 +404,16 @@ func writerWorker() {
 			log.Printf("[writerWorker] inserted batch session_id=%s app_type=%s events=%d", batch[0].SessionID, batch[0].AppType, len(batch))
 		}
 	}
-}
 
+	// Close database connection when channel is closed (shutdown)
+	if db != nil {
+		log.Println("[writerWorker] closing database connection on shutdown")
+		if err := db.Close(); err != nil {
+			log.Printf("[writerWorker] error closing database: %v", err)
+		}
+	}
+	log.Println("[writerWorker] worker stopped")
+}
 
 func initUserSessionsDB(dbPath string) error {
 	db, err := sql.Open("duckdb", dbPath)
@@ -626,8 +667,6 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 	enc.Encode(out)
 }
 
-
-
 // File: go.mod
 // module rrweb-duckdb-server
 
@@ -636,7 +675,6 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 // require (
 //     github.com/duckdb/duckdb-go/v2 v0.0.0-... // use latest
 // )
-
 
 // File: Dockerfile
 
@@ -655,7 +693,6 @@ VOLUME ["/data"]
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/rrweb-duckdb-server"]
 */
-
 
 // File: README.md
 
