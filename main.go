@@ -40,6 +40,8 @@ import (
 const (
 	dataDir = "./data"
 	duckDir = dataDir + "/duck"
+	// checkpointInterval is how often to checkpoint the WAL during idle periods
+	checkpointInterval = 30 * time.Second
 )
 
 // EventRow holds one rrweb event mapped to a DB row
@@ -327,6 +329,7 @@ func recordUserSessionHandler(w http.ResponseWriter, r *http.Request) {
 // inside a transaction for speed.
 // When ingestCh is closed, it will exit after processing remaining batches
 // and properly closing the database connection.
+// Periodically checkpoints the WAL to prevent it from persisting during idle periods.
 func writerWorker() {
 	defer wg.Done()
 
@@ -334,79 +337,103 @@ func writerWorker() {
 	var db *sql.DB
 	var err error
 
-	for batch := range ingestCh {
-		// Log batch info (all events in batch have same session_id)
-		if len(batch) > 0 {
-			log.Printf("[writerWorker] inserting batch session_id=%s app_type=%s events=%d", batch[0].SessionID, batch[0].AppType, len(batch))
-		}
+	// Ticker for periodic checkpointing during idle periods
+	checkpointTicker := time.NewTicker(checkpointInterval)
+	defer checkpointTicker.Stop()
 
-		// determine day for the batch (UTC date)
-		day := time.Now().UTC().Format("2006_01_02")
-		if db == nil || day != currentDay {
-			// close old
-			if db != nil {
-				db.Close()
+	for {
+		select {
+		case batch, ok := <-ingestCh:
+			if !ok {
+				// Channel closed, exit
+				goto cleanup
 			}
-			// open new DB file for the day
-			fpath := filepath.Join(duckDir, fmt.Sprintf("events_%s.duckdb", day))
-			// the DSN for go-duckdb is simply the path
-			db, err = sql.Open("duckdb", fpath)
-			if err != nil {
-				log.Printf("failed to open duckdb %s: %v", fpath, err)
-				db = nil
-				// backoff and requeue batch later? For simplicity, drop this batch
-				continue
-			}
-			currentDay = day
-			// ensure table exists
-			if err := ensureTable(db); err != nil {
-				log.Printf("failed to ensure table: %v", err)
-			}
-		}
 
-		if db == nil {
-			// if DB unavailable, drop or buffer (we drop here)
-			continue
-		}
-
-		// write batch in transaction
-		tx, err := db.Begin()
-		if err != nil {
-			log.Printf("begin tx err: %v", err)
-			continue
-		}
-		stmt, err := tx.Prepare("INSERT INTO events (ts, session_id, app_type, event) VALUES (?, ?, ?, ?)")
-		if err != nil {
-			log.Printf("prepare err: %v", err)
-			tx.Rollback()
-			continue
-		}
-
-		for _, r := range batch {
-			_, err := stmt.Exec(r.Ts.Format(time.RFC3339Nano), r.SessionID, r.AppType, r.EventJSON)
-			if err != nil {
-				log.Printf("insert err: %v", err)
-				// continue inserting remaining rows
-				continue
-			}
-		}
-
-		stmt.Close()
-		if err := tx.Commit(); err != nil {
+			// Log batch info (all events in batch have same session_id)
 			if len(batch) > 0 {
-				log.Printf("[writerWorker] session_id=%s events=%d ERROR: commit failed: %v", batch[0].SessionID, len(batch), err)
+				log.Printf("[writerWorker] inserting batch session_id=%s app_type=%s events=%d", batch[0].SessionID, batch[0].AppType, len(batch))
 			}
-			continue
-		}
 
-		// Log successful insert
-		if len(batch) > 0 {
-			log.Printf("[writerWorker] inserted batch session_id=%s app_type=%s events=%d", batch[0].SessionID, batch[0].AppType, len(batch))
+			// determine day for the batch (UTC date)
+			day := time.Now().UTC().Format("2006_01_02")
+			if db == nil || day != currentDay {
+				// close old
+				if db != nil {
+					db.Close()
+				}
+				// open new DB file for the day
+				fpath := filepath.Join(duckDir, fmt.Sprintf("events_%s.duckdb", day))
+				// the DSN for go-duckdb is simply the path
+				db, err = sql.Open("duckdb", fpath)
+				if err != nil {
+					log.Printf("failed to open duckdb %s: %v", fpath, err)
+					db = nil
+					// backoff and requeue batch later? For simplicity, drop this batch
+					continue
+				}
+				currentDay = day
+				// ensure table exists
+				if err := ensureTable(db); err != nil {
+					log.Printf("failed to ensure table: %v", err)
+				}
+			}
+
+			if db == nil {
+				// if DB unavailable, drop or buffer (we drop here)
+				continue
+			}
+
+			// write batch in transaction
+			tx, err := db.Begin()
+			if err != nil {
+				log.Printf("begin tx err: %v", err)
+				continue
+			}
+			stmt, err := tx.Prepare("INSERT INTO events (ts, session_id, app_type, event) VALUES (?, ?, ?, ?)")
+			if err != nil {
+				log.Printf("prepare err: %v", err)
+				tx.Rollback()
+				continue
+			}
+
+			for _, r := range batch {
+				_, err := stmt.Exec(r.Ts.Format(time.RFC3339Nano), r.SessionID, r.AppType, r.EventJSON)
+				if err != nil {
+					log.Printf("insert err: %v", err)
+					// continue inserting remaining rows
+					continue
+				}
+			}
+
+			stmt.Close()
+			if err := tx.Commit(); err != nil {
+				if len(batch) > 0 {
+					log.Printf("[writerWorker] session_id=%s events=%d ERROR: commit failed: %v", batch[0].SessionID, len(batch), err)
+				}
+				continue
+			}
+
+			// Log successful insert
+			if len(batch) > 0 {
+				log.Printf("[writerWorker] inserted batch session_id=%s app_type=%s events=%d", batch[0].SessionID, batch[0].AppType, len(batch))
+			}
+
+		case <-checkpointTicker.C:
+			// Periodic checkpoint during idle periods
+			if db != nil {
+				if err := checkpointDB(db); err != nil {
+					log.Printf("[writerWorker] periodic checkpoint error: %v", err)
+				}
+			}
 		}
 	}
 
-	// Close database connection when channel is closed (shutdown)
+cleanup:
+	// Final checkpoint before closing
 	if db != nil {
+		if err := checkpointDB(db); err != nil {
+			log.Printf("[writerWorker] final checkpoint error: %v", err)
+		}
 		log.Println("[writerWorker] closing database connection on shutdown")
 		if err := db.Close(); err != nil {
 			log.Printf("[writerWorker] error closing database: %v", err)
@@ -454,6 +481,13 @@ func ensureTable(db *sql.DB) error {
 	}
 	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN IF NOT EXISTS app_type VARCHAR;`)
 	return nil
+}
+
+// checkpointDB checkpoints the WAL file, merging it into the main database file.
+// This prevents WAL files from persisting during idle periods.
+func checkpointDB(db *sql.DB) error {
+	_, err := db.Exec("CHECKPOINT")
+	return err
 }
 
 // replayHandler streams events for a session ordered by ts as NDJSON. To keep
