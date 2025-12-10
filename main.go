@@ -77,6 +77,16 @@ type SessionMeta struct {
 	File      string `json:"file"`
 }
 
+// error event with user info for debugging
+type ErrorEvent struct {
+	SessionID string `json:"sessionId"`
+	UserID    string `json:"userId,omitempty"`
+	AppType   string `json:"appType,omitempty"`
+	TS        int64  `json:"ts"`
+	Event     string `json:"event"`
+	File      string `json:"file"`
+}
+
 var (
 	// channel for batched ingestion; each item is a batch (slice) of EventRow
 	ingestCh = make(chan []EventRow, 512)
@@ -123,6 +133,7 @@ func main() {
 	http.HandleFunc("/record_user_session", corsMiddleware(recordUserSessionHandler))
 	http.HandleFunc("/replay", corsMiddleware(replayHandler))
 	http.HandleFunc("/query_user", corsMiddleware(queryUserHandler))
+	http.HandleFunc("/debug_errors", corsMiddleware(debugErrorsHandler))
 
 	// Serve HTML page
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -699,6 +710,93 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.Encode(out)
+}
+
+// debugErrorsHandler queries for error events and returns them with associated user IDs
+func debugErrorsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	app := r.URL.Query().Get("app")
+	if app == "" {
+		http.Error(w, "missing app", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[GET /debug_errors] app_type=%s", app)
+
+	// Load session_id -> user_id mapping from user_sessions table
+	sessionToUser := make(map[string]string)
+	userSessionsDB := filepath.Join(duckDir, "user_sessions.duckdb")
+	db, err := sql.Open("duckdb", userSessionsDB)
+	if err == nil {
+		rows, err := db.Query("SELECT session_id, user_id FROM user_sessions WHERE app_type = ?", app)
+		if err == nil {
+			for rows.Next() {
+				var sessionID, userID string
+				if err := rows.Scan(&sessionID, &userID); err == nil {
+					sessionToUser[sessionID] = userID
+				}
+			}
+			rows.Close()
+		}
+		db.Close()
+	}
+
+	// Find all error events across daily files
+	files, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	var errorEvents []ErrorEvent
+
+	// Query each daily file for error events
+	for _, f := range files {
+		db, err := sql.Open("duckdb", f)
+		if err != nil {
+			log.Printf("open %s err: %v", f, err)
+			continue
+		}
+
+		// Query for events containing 'error' (case-insensitive)
+		rows, err := db.Query("SELECT ts, session_id, app_type, event FROM events WHERE event ILIKE ? AND app_type = ? ORDER BY ts", "%\"level\":\"error\"%", app)
+		if err != nil {
+			// no table or other error
+			db.Close()
+			continue
+		}
+
+		for rows.Next() {
+			var ts sql.NullTime
+			var sessionID, appType, event string
+			if err := rows.Scan(&ts, &sessionID, &appType, &event); err != nil {
+				continue
+			}
+
+			errorEvent := ErrorEvent{
+				SessionID: sessionID,
+				UserID:    sessionToUser[sessionID], // Get user_id from mapping
+				AppType:   appType,
+				Event:     event,
+				File:      filepath.Base(f),
+			}
+			if ts.Valid {
+				errorEvent.TS = ts.Time.UnixMilli()
+			}
+
+			errorEvents = append(errorEvents, errorEvent)
+		}
+		rows.Close()
+		db.Close()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.Encode(errorEvents)
 }
 
 // File: go.mod
