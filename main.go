@@ -38,18 +38,24 @@ import (
 //  - authentication/authorization left as TODO (add JWT/API keys in production)
 
 const (
-	dataDir = "./data"
-	duckDir = dataDir + "/duck"
+	dataDir    = "./data"
+	duckDir    = dataDir + "/duck"
+	parquetDir = dataDir + "/parquet"
 	// checkpointInterval is how often to checkpoint the WAL during idle periods
 	checkpointInterval = 30 * time.Second
+	// archiveCheckInterval is how often to check for day boundary changes
+	archiveCheckInterval = 1 * time.Minute
 )
 
 // EventRow holds one rrweb event mapped to a DB row
 type EventRow struct {
-	Ts        time.Time `json:"ts"`
-	SessionID string    `json:"session_id"`
-	AppType   string    `json:"app_type"`
-	EventJSON string    `json:"event_json"`
+	Ts           time.Time `json:"ts"`
+	SessionID    string    `json:"session_id"`
+	AppType      string    `json:"app_type"`
+	EventJSON    string    `json:"event_json"`
+	EventType    string    `json:"event_type"`    // Parsed "type" field
+	ErrorLevel   string    `json:"error_level"`   // Parsed "data.payload.level"
+	ErrorPayload string    `json:"error_payload"` // Parsed "data.payload.payload"
 }
 
 // payload from frontend
@@ -77,14 +83,16 @@ type SessionMeta struct {
 	File      string `json:"file"`
 }
 
-// error event with user info for debugging
-type ErrorEvent struct {
-	SessionID string `json:"sessionId"`
-	UserID    string `json:"userId,omitempty"`
-	AppType   string `json:"appType,omitempty"`
-	TS        int64  `json:"ts"`
-	Event     string `json:"event"`
-	File      string `json:"file"`
+// error group for aggregated error reporting
+type ErrorGroup struct {
+	ErrorLevel       string `json:"errorLevel"`
+	ErrorPayload     string `json:"errorPayload"`
+	Count            int64  `json:"count"`
+	FirstSeen        int64  `json:"firstSeen"`
+	LastSeen         int64  `json:"lastSeen"`
+	AffectedSessions int64  `json:"affectedSessions"`
+	AffectedUsers    int64  `json:"affectedUsers"`
+	SampleEvent      string `json:"sampleEvent"`
 }
 
 var (
@@ -93,12 +101,18 @@ var (
 
 	// waitgroup for background workers
 	wg sync.WaitGroup
+
+	// stop signal for archive worker
+	archiveStopCh = make(chan struct{})
 )
 
 func main() {
 	// ensure directories
 	if err := os.MkdirAll(duckDir, 0o755); err != nil {
 		log.Fatalf("failed to create data dir: %v", err)
+	}
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		log.Fatalf("failed to create parquet dir: %v", err)
 	}
 
 	// initialize user-sessions database
@@ -110,6 +124,10 @@ func main() {
 	// start writer worker
 	wg.Add(1)
 	go writerWorker()
+
+	// start archive worker for day-end Parquet export
+	wg.Add(1)
+	go archiveWorker()
 
 	// CORS middleware
 	corsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
@@ -181,6 +199,8 @@ func main() {
 
 	// Close ingest channel to signal writerWorker to stop
 	close(ingestCh)
+	// Signal archive worker to stop
+	close(archiveStopCh)
 	log.Println("waiting for writer worker to finish...")
 
 	// Wait for background tasks to complete
@@ -248,11 +268,16 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	rows := make([]EventRow, 0, len(p.Events))
 	for _, ev := range p.Events {
+		eventJSON := string(ev)
+		eventType, errorLevel, errorPayload := parseEventFields(ev)
 		rows = append(rows, EventRow{
-			Ts:        now,
-			SessionID: p.SessionID,
-			AppType:   p.AppType,
-			EventJSON: string(ev),
+			Ts:           now,
+			SessionID:    p.SessionID,
+			AppType:      p.AppType,
+			EventJSON:    eventJSON,
+			EventType:    eventType,
+			ErrorLevel:   errorLevel,
+			ErrorPayload: errorPayload,
 		})
 	}
 
@@ -400,7 +425,7 @@ func writerWorker() {
 				log.Printf("begin tx err: %v", err)
 				continue
 			}
-			stmt, err := tx.Prepare("INSERT INTO events (ts, session_id, app_type, event) VALUES (?, ?, ?, ?)")
+			stmt, err := tx.Prepare("INSERT INTO events (ts, session_id, app_type, event, event_type, error_level, error_payload) VALUES (?, ?, ?, ?, ?, ?, ?)")
 			if err != nil {
 				log.Printf("prepare err: %v", err)
 				tx.Rollback()
@@ -408,7 +433,15 @@ func writerWorker() {
 			}
 
 			for _, r := range batch {
-				_, err := stmt.Exec(r.Ts.Format(time.RFC3339Nano), r.SessionID, r.AppType, r.EventJSON)
+				_, err := stmt.Exec(
+					r.Ts.Format(time.RFC3339Nano),
+					r.SessionID,
+					r.AppType,
+					r.EventJSON,
+					nullString(r.EventType),
+					nullString(r.ErrorLevel),
+					nullString(r.ErrorPayload),
+				)
 				if err != nil {
 					log.Printf("insert err: %v", err)
 					// continue inserting remaining rows
@@ -484,13 +517,27 @@ func ensureTable(db *sql.DB) error {
 		ts TIMESTAMP,
 		session_id VARCHAR,
 		app_type VARCHAR,
-		event TEXT
+		event TEXT,
+		event_type VARCHAR,
+		error_level VARCHAR,
+		error_payload TEXT
 	);
 	`)
 	if err != nil {
 		return err
 	}
+	// Add columns for backward compatibility with existing tables
 	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN IF NOT EXISTS app_type VARCHAR;`)
+	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN IF NOT EXISTS event_type VARCHAR;`)
+	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN IF NOT EXISTS error_level VARCHAR;`)
+	_, _ = db.Exec(`ALTER TABLE events ADD COLUMN IF NOT EXISTS error_payload TEXT;`)
+
+	// Create indexes for faster error queries
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_error_level ON events(error_level);`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_error_payload ON events(error_payload);`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_ts ON events(ts);`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_session_app ON events(session_id, app_type);`)
+
 	return nil
 }
 
@@ -501,8 +548,171 @@ func checkpointDB(db *sql.DB) error {
 	return err
 }
 
-// replayHandler streams events for a session ordered by ts as NDJSON. To keep
-// the implementation simple, we search across all daily files in data/duck.
+// parseEventFields extracts event_type, error_level, and error_payload from event JSON
+func parseEventFields(eventJSON json.RawMessage) (eventType, errorLevel, errorPayload string) {
+	var event map[string]interface{}
+	if err := json.Unmarshal(eventJSON, &event); err != nil {
+		return "", "", ""
+	}
+
+	// Extract "type" field
+	if t, ok := event["type"].(string); ok {
+		eventType = t
+	}
+
+	// Extract "data.payload.level" and "data.payload.payload"
+	if data, ok := event["data"].(map[string]interface{}); ok {
+		if payload, ok := data["payload"].(map[string]interface{}); ok {
+			if level, ok := payload["level"].(string); ok {
+				errorLevel = level
+			}
+			if payloadData, ok := payload["payload"].(string); ok {
+				errorPayload = payloadData
+			}
+		}
+	}
+
+	return eventType, errorLevel, errorPayload
+}
+
+// nullString returns NULL for empty strings, otherwise returns the string
+// This is used for SQL NULL handling
+func nullString(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// archiveWorker runs periodically to check for day boundary changes and export
+// previous day's data from DuckDB to Parquet format
+func archiveWorker() {
+	defer wg.Done()
+
+	// Check for unarchived days on startup
+	if err := archiveUnprocessedDays(); err != nil {
+		log.Printf("[archiveWorker] error archiving unprocessed days: %v", err)
+	}
+
+	ticker := time.NewTicker(archiveCheckInterval)
+	defer ticker.Stop()
+
+	var lastArchivedDay string
+
+	for {
+		select {
+		case <-archiveStopCh:
+			log.Printf("[archiveWorker] stop signal received, exiting")
+			return
+		case <-ticker.C:
+			// Get yesterday's date (previous day to archive)
+			yesterday := time.Now().UTC().AddDate(0, 0, -1).Format("2006_01_02")
+
+			// Skip if already archived
+			if yesterday == lastArchivedDay {
+				continue
+			}
+
+			// Check if yesterday's DuckDB file exists
+			duckPath := filepath.Join(duckDir, fmt.Sprintf("events_%s.duckdb", yesterday))
+			if _, err := os.Stat(duckPath); os.IsNotExist(err) {
+				// File doesn't exist, nothing to archive
+				continue
+			}
+
+			// Export to Parquet
+			if err := exportDayToParquet(yesterday); err != nil {
+				log.Printf("[archiveWorker] error exporting %s to parquet: %v", yesterday, err)
+				continue
+			}
+
+			log.Printf("[archiveWorker] successfully archived day %s", yesterday)
+			lastArchivedDay = yesterday
+		}
+	}
+}
+
+// archiveUnprocessedDays checks for DuckDB files that haven't been archived yet
+func archiveUnprocessedDays() error {
+	// Find all DuckDB files
+	duckFiles, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
+	if err != nil {
+		return err
+	}
+
+	today := time.Now().UTC().Format("2006_01_02")
+
+	for _, duckFile := range duckFiles {
+		// Extract date from filename
+		baseName := filepath.Base(duckFile)
+		day := baseName[len("events_") : len(baseName)-len(".duckdb")]
+
+		// Skip today's file (still being written to)
+		if day == today {
+			continue
+		}
+
+		// Check if Parquet file already exists
+		parquetPath := filepath.Join(parquetDir, fmt.Sprintf("events_%s.parquet", day))
+		if _, err := os.Stat(parquetPath); err == nil {
+			// Parquet already exists, skip
+			continue
+		}
+
+		// Export to Parquet
+		if err := exportDayToParquet(day); err != nil {
+			log.Printf("[archiveUnprocessedDays] error exporting %s: %v", day, err)
+			continue
+		}
+
+		log.Printf("[archiveUnprocessedDays] archived unprocessed day %s", day)
+	}
+
+	return nil
+}
+
+// exportDayToParquet exports a specific day's data from DuckDB to Parquet format
+func exportDayToParquet(day string) error {
+	duckPath := filepath.Join(duckDir, fmt.Sprintf("events_%s.duckdb", day))
+	parquetPath := filepath.Join(parquetDir, fmt.Sprintf("events_%s.parquet", day))
+
+	// Open DuckDB file
+	db, err := sql.Open("duckdb", duckPath)
+	if err != nil {
+		return fmt.Errorf("failed to open DuckDB: %w", err)
+	}
+	defer db.Close()
+
+	// Check if table exists and has data
+	var rowCount int64
+	err = db.QueryRow("SELECT COUNT(*) FROM events").Scan(&rowCount)
+	if err != nil {
+		return fmt.Errorf("failed to check table: %w", err)
+	}
+
+	if rowCount == 0 {
+		log.Printf("[exportDayToParquet] day %s has no data, skipping", day)
+		return nil
+	}
+
+	// Export to Parquet using COPY command
+	exportSQL := fmt.Sprintf("COPY (SELECT * FROM events) TO '%s' (FORMAT PARQUET)", parquetPath)
+	_, err = db.Exec(exportSQL)
+	if err != nil {
+		return fmt.Errorf("failed to export to Parquet: %w", err)
+	}
+
+	// Delete DuckDB file after successful export
+	if err := os.Remove(duckPath); err != nil {
+		log.Printf("[exportDayToParquet] warning: failed to delete DuckDB file %s: %v", duckPath, err)
+		// Don't return error, export was successful
+	}
+
+	return nil
+}
+
+// replayHandler streams events for a session ordered by ts as NDJSON.
+// Queries both DuckDB (current day) and Parquet (historical days) files.
 func replayHandler(w http.ResponseWriter, r *http.Request) {
 	s := r.URL.Query().Get("session")
 	app := r.URL.Query().Get("app")
@@ -519,36 +729,79 @@ func replayHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
-	// find all duckdb files
-	files, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
-	if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
+	// Query DuckDB files (current day)
+	duckFiles, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
+	if err == nil {
+		for _, f := range duckFiles {
+			queryEventsFromDuckDB(f, s, app, w)
+		}
 	}
 
-	// for each file, open and query matching session rows
-	for _, f := range files {
-		db, err := sql.Open("duckdb", f)
-		if err != nil {
-			log.Printf("open %s err: %v", f, err)
+	// Query Parquet files (historical days)
+	parquetFiles, err := filepath.Glob(filepath.Join(parquetDir, "events_*.parquet"))
+	if err == nil {
+		for _, f := range parquetFiles {
+			queryEventsFromParquet(f, s, app, w)
+		}
+	}
+}
+
+// queryEventsFromDuckDB queries events from a DuckDB file
+func queryEventsFromDuckDB(dbPath, sessionID, appType string, w http.ResponseWriter) {
+	db, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		log.Printf("open %s err: %v", dbPath, err)
+		return
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT event FROM events WHERE session_id = ? AND app_type = ? ORDER BY ts", sessionID, appType)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ev string
+		if err := rows.Scan(&ev); err != nil {
 			continue
 		}
-		rows, err := db.Query("SELECT event FROM events WHERE session_id = ? AND app_type = ? ORDER BY ts", s, app)
-		if err != nil {
-			// no table or other error
-			db.Close()
+		w.Write([]byte(ev))
+		w.Write([]byte("\n"))
+	}
+}
+
+// queryEventsFromParquet queries events from a Parquet file using DuckDB's read_parquet function
+func queryEventsFromParquet(parquetPath, sessionID, appType string, w http.ResponseWriter) {
+	// Use an in-memory DuckDB to query Parquet file
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		log.Printf("failed to open DuckDB for Parquet query: %v", err)
+		return
+	}
+	defer db.Close()
+
+	// Query Parquet file using read_parquet function
+	query := fmt.Sprintf(`
+		SELECT event 
+		FROM read_parquet('%s') 
+		WHERE session_id = ? AND app_type = ? 
+		ORDER BY ts
+	`, parquetPath)
+
+	rows, err := db.Query(query, sessionID, appType)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ev string
+		if err := rows.Scan(&ev); err != nil {
 			continue
 		}
-		for rows.Next() {
-			var ev string
-			if err := rows.Scan(&ev); err != nil {
-				continue
-			}
-			w.Write([]byte(ev))
-			w.Write([]byte("\n"))
-		}
-		rows.Close()
-		db.Close()
+		w.Write([]byte(ev))
+		w.Write([]byte("\n"))
 	}
 }
 
@@ -595,13 +848,7 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query database directly for session metadata
-	files, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
-	if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
-
+	// Query database directly for session metadata from both DuckDB and Parquet files
 	sessionMeta := make(map[string]*SessionMeta)
 
 	// Build placeholders for IN clause
@@ -610,95 +857,20 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 		sessionIDList = append(sessionIDList, sid)
 	}
 
-	for _, f := range files {
-		db, err := sql.Open("duckdb", f)
-		if err != nil {
-			log.Printf("open %s err: %v", f, err)
-			continue
+	// Query DuckDB files
+	duckFiles, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
+	if err == nil {
+		for _, f := range duckFiles {
+			querySessionMetaFromDuckDB(f, sessionIDList, app, sessionMeta, sessionToUser)
 		}
+	}
 
-		// Build query with IN clause
-		placeholders := ""
-		for i := 0; i < len(sessionIDList); i++ {
-			if i > 0 {
-				placeholders += ","
-			}
-			placeholders += "?"
+	// Query Parquet files
+	parquetFiles, err := filepath.Glob(filepath.Join(parquetDir, "events_*.parquet"))
+	if err == nil {
+		for _, f := range parquetFiles {
+			querySessionMetaFromParquet(f, sessionIDList, app, sessionMeta, sessionToUser)
 		}
-
-		query := fmt.Sprintf(`
-			SELECT 
-				session_id,
-				MIN(ts) as first_ts,
-				MAX(ts) as last_ts,
-				COUNT(*) as event_count,
-				SUM(LENGTH(event)) as total_size
-			FROM events 
-			WHERE session_id IN (%s) AND app_type = ?
-			GROUP BY session_id
-		`, placeholders)
-
-		args := append(sessionIDList, app)
-		rows, err := db.Query(query, args...)
-		if err != nil {
-			log.Printf("query err: %v", err)
-			db.Close()
-			continue
-		}
-
-		for rows.Next() {
-			var sessionID string
-			var firstTS, lastTS sql.NullTime
-			var eventCount int64
-			var totalSize sql.NullInt64
-
-			if err := rows.Scan(&sessionID, &firstTS, &lastTS, &eventCount, &totalSize); err != nil {
-				continue
-			}
-
-			if existing, ok := sessionMeta[sessionID]; ok {
-				// Update with earliest firstTs and latest lastTs across files
-				// Preserve userId if not set
-				if existing.UserID == "" && sessionToUser[sessionID] != "" {
-					existing.UserID = sessionToUser[sessionID]
-				}
-				if firstTS.Valid {
-					firstTSMs := firstTS.Time.UnixMilli()
-					if existing.FirstTS == 0 || firstTSMs < existing.FirstTS {
-						existing.FirstTS = firstTSMs
-					}
-				}
-				if lastTS.Valid {
-					lastTSMs := lastTS.Time.UnixMilli()
-					if lastTSMs > existing.LastTS {
-						existing.LastTS = lastTSMs
-					}
-				}
-				if totalSize.Valid {
-					existing.Size += totalSize.Int64
-				}
-			} else {
-				// Create new entry
-				meta := &SessionMeta{
-					SessionID: sessionID,
-					AppType:   app,
-					UserID:    sessionToUser[sessionID], // Add user_id from mapping
-					File:      filepath.Base(f),
-				}
-				if firstTS.Valid {
-					meta.FirstTS = firstTS.Time.UnixMilli()
-				}
-				if lastTS.Valid {
-					meta.LastTS = lastTS.Time.UnixMilli()
-				}
-				if totalSize.Valid {
-					meta.Size = totalSize.Int64
-				}
-				sessionMeta[sessionID] = meta
-			}
-		}
-		rows.Close()
-		db.Close()
 	}
 
 	// Convert map to slice
@@ -712,7 +884,156 @@ func queryUserHandler(w http.ResponseWriter, r *http.Request) {
 	enc.Encode(out)
 }
 
-// debugErrorsHandler queries for error events and returns them with associated user IDs
+// querySessionMetaFromDuckDB queries session metadata from a DuckDB file
+func querySessionMetaFromDuckDB(dbPath string, sessionIDList []interface{}, app string, sessionMeta map[string]*SessionMeta, sessionToUser map[string]string) {
+	db, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		log.Printf("open %s err: %v", dbPath, err)
+		return
+	}
+	defer db.Close()
+
+	// Build query with IN clause
+	placeholders := ""
+	for i := 0; i < len(sessionIDList); i++ {
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT 
+			session_id,
+			MIN(ts) as first_ts,
+			MAX(ts) as last_ts,
+			COUNT(*) as event_count,
+			SUM(LENGTH(event)) as total_size
+		FROM events 
+		WHERE session_id IN (%s) AND app_type = ?
+		GROUP BY session_id
+	`, placeholders)
+
+	args := append(sessionIDList, app)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		log.Printf("query err: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sessionID string
+		var firstTS, lastTS sql.NullTime
+		var eventCount int64
+		var totalSize sql.NullInt64
+
+		if err := rows.Scan(&sessionID, &firstTS, &lastTS, &eventCount, &totalSize); err != nil {
+			continue
+		}
+
+		updateSessionMeta(sessionMeta, sessionID, app, sessionToUser, firstTS, lastTS, totalSize, filepath.Base(dbPath))
+	}
+}
+
+// querySessionMetaFromParquet queries session metadata from a Parquet file
+func querySessionMetaFromParquet(parquetPath string, sessionIDList []interface{}, app string, sessionMeta map[string]*SessionMeta, sessionToUser map[string]string) {
+	// Use an in-memory DuckDB to query Parquet file
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		log.Printf("failed to open DuckDB for Parquet query: %v", err)
+		return
+	}
+	defer db.Close()
+
+	// Build query with IN clause
+	placeholders := ""
+	for i := 0; i < len(sessionIDList); i++ {
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT 
+			session_id,
+			MIN(ts) as first_ts,
+			MAX(ts) as last_ts,
+			COUNT(*) as event_count,
+			SUM(LENGTH(event)) as total_size
+		FROM read_parquet('%s')
+		WHERE session_id IN (%s) AND app_type = ?
+		GROUP BY session_id
+	`, parquetPath, placeholders)
+
+	args := append(sessionIDList, app)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		log.Printf("query err: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sessionID string
+		var firstTS, lastTS sql.NullTime
+		var eventCount int64
+		var totalSize sql.NullInt64
+
+		if err := rows.Scan(&sessionID, &firstTS, &lastTS, &eventCount, &totalSize); err != nil {
+			continue
+		}
+
+		updateSessionMeta(sessionMeta, sessionID, app, sessionToUser, firstTS, lastTS, totalSize, filepath.Base(parquetPath))
+	}
+}
+
+// updateSessionMeta updates or creates session metadata entry
+func updateSessionMeta(sessionMeta map[string]*SessionMeta, sessionID, app string, sessionToUser map[string]string, firstTS, lastTS sql.NullTime, totalSize sql.NullInt64, fileName string) {
+	if existing, ok := sessionMeta[sessionID]; ok {
+		// Update with earliest firstTs and latest lastTs across files
+		if existing.UserID == "" && sessionToUser[sessionID] != "" {
+			existing.UserID = sessionToUser[sessionID]
+		}
+		if firstTS.Valid {
+			firstTSMs := firstTS.Time.UnixMilli()
+			if existing.FirstTS == 0 || firstTSMs < existing.FirstTS {
+				existing.FirstTS = firstTSMs
+			}
+		}
+		if lastTS.Valid {
+			lastTSMs := lastTS.Time.UnixMilli()
+			if lastTSMs > existing.LastTS {
+				existing.LastTS = lastTSMs
+			}
+		}
+		if totalSize.Valid {
+			existing.Size += totalSize.Int64
+		}
+	} else {
+		// Create new entry
+		meta := &SessionMeta{
+			SessionID: sessionID,
+			AppType:   app,
+			UserID:    sessionToUser[sessionID],
+			File:      fileName,
+		}
+		if firstTS.Valid {
+			meta.FirstTS = firstTS.Time.UnixMilli()
+		}
+		if lastTS.Valid {
+			meta.LastTS = lastTS.Time.UnixMilli()
+		}
+		if totalSize.Valid {
+			meta.Size = totalSize.Int64
+		}
+		sessionMeta[sessionID] = meta
+	}
+}
+
+// debugErrorsHandler queries for error events grouped by error_level and error_payload
+// within a date range and returns aggregated counts
 func debugErrorsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -725,13 +1046,52 @@ func debugErrorsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[GET /debug_errors] app_type=%s", app)
+	// Parse date range parameters
+	startDateStr := r.URL.Query().Get("start_date")
+	endDateStr := r.URL.Query().Get("end_date")
+
+	// Default to last 30 days if not specified
+	now := time.Now().UTC()
+	var startDate, endDate time.Time
+	if startDateStr == "" {
+		startDate = now.AddDate(0, 0, -30)
+	} else {
+		var err error
+		startDate, err = time.Parse("2006-01-02", startDateStr)
+		if err != nil {
+			http.Error(w, "invalid start_date format (use YYYY-MM-DD)", http.StatusBadRequest)
+			return
+		}
+		startDate = startDate.UTC()
+	}
+
+	if endDateStr == "" {
+		endDate = now
+	} else {
+		var err error
+		endDate, err = time.Parse("2006-01-02", endDateStr)
+		if err != nil {
+			http.Error(w, "invalid end_date format (use YYYY-MM-DD)", http.StatusBadRequest)
+			return
+		}
+		// Make end_date inclusive by setting to end of day
+		endDate = time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 999999999, time.UTC)
+	}
+
+	if startDate.After(endDate) {
+		http.Error(w, "start_date must be before or equal to end_date", http.StatusBadRequest)
+		return
+	}
+
+	startTime := time.Now()
+	log.Printf("[GET /debug_errors] app_type=%s start_date=%s end_date=%s", app, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
 
 	// Load session_id -> user_id mapping from user_sessions table
 	sessionToUser := make(map[string]string)
 	userSessionsDB := filepath.Join(duckDir, "user_sessions.duckdb")
 	db, err := sql.Open("duckdb", userSessionsDB)
 	if err == nil {
+		mapStart := time.Now()
 		rows, err := db.Query("SELECT session_id, user_id FROM user_sessions WHERE app_type = ?", app)
 		if err == nil {
 			for rows.Next() {
@@ -743,60 +1103,312 @@ func debugErrorsHandler(w http.ResponseWriter, r *http.Request) {
 			rows.Close()
 		}
 		db.Close()
+		log.Printf("[debug_errors] loaded session->user mappings: %d rows in %s", len(sessionToUser), time.Since(mapStart))
 	}
 
-	// Find all error events across daily files
-	files, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
-	if err != nil {
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
+	// Aggregate error groups from both DuckDB and Parquet files
+	errorGroups := make(map[string]*ErrorGroup) // key: error_level + "|" + error_payload
+
+	// Query DuckDB files
+	// duckFiles, err := filepath.Glob(filepath.Join(duckDir, "events_*.duckdb"))
+	// if err == nil {
+	// 	for _, f := range duckFiles {
+	// 		queryErrorGroupsFromDuckDB(f, app, startDate, endDate, errorGroups)
+	// 	}
+	// }
+
+	// Query Parquet files
+	parquetFiles, err := filepath.Glob(filepath.Join(parquetDir, "events_*.parquet"))
+	if err == nil {
+		log.Printf("[debug_errors] parquet files=%d", len(parquetFiles))
+		for _, f := range parquetFiles {
+			fileStart := time.Now()
+			queryErrorGroupsFromParquet(f, app, startDate, endDate, errorGroups)
+			log.Printf("[debug_errors] parquet file=%s processed in %s", filepath.Base(f), time.Since(fileStart))
+		}
 	}
 
-	var errorEvents []ErrorEvent
+	// Calculate affected users for each error group
+	affectedStart := time.Now()
+	calculateAffectedUsers(errorGroups, app, startDate, endDate, sessionToUser)
+	log.Printf("[debug_errors] affected users calculated in %s", time.Since(affectedStart))
 
-	// Query each daily file for error events
-	for _, f := range files {
-		db, err := sql.Open("duckdb", f)
-		if err != nil {
-			log.Printf("open %s err: %v", f, err)
-			continue
-		}
+	// Convert map to slice and sort by count (descending)
+	errorGroupList := make([]*ErrorGroup, 0, len(errorGroups))
+	for _, group := range errorGroups {
+		errorGroupList = append(errorGroupList, group)
+	}
 
-		// Query for events containing 'error' (case-insensitive)
-		rows, err := db.Query("SELECT ts, session_id, app_type, event FROM events WHERE event ILIKE ? AND app_type = ? ORDER BY ts", "%\"level\":\"error\"%", app)
-		if err != nil {
-			// no table or other error
-			db.Close()
-			continue
-		}
-
-		for rows.Next() {
-			var ts sql.NullTime
-			var sessionID, appType, event string
-			if err := rows.Scan(&ts, &sessionID, &appType, &event); err != nil {
-				continue
+	// Simple sort by count (descending)
+	for i := 0; i < len(errorGroupList)-1; i++ {
+		for j := i + 1; j < len(errorGroupList); j++ {
+			if errorGroupList[i].Count < errorGroupList[j].Count {
+				errorGroupList[i], errorGroupList[j] = errorGroupList[j], errorGroupList[i]
 			}
-
-			errorEvent := ErrorEvent{
-				SessionID: sessionID,
-				UserID:    sessionToUser[sessionID], // Get user_id from mapping
-				AppType:   appType,
-				Event:     event,
-				File:      filepath.Base(f),
-			}
-			if ts.Valid {
-				errorEvent.TS = ts.Time.UnixMilli()
-			}
-
-			errorEvents = append(errorEvents, errorEvent)
 		}
-		rows.Close()
-		db.Close()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
-	enc.Encode(errorEvents)
+	enc.Encode(errorGroupList)
+	log.Printf("[debug_errors] completed groups=%d total_duration=%s", len(errorGroupList), time.Since(startTime))
+}
+
+// calculateAffectedUsers calculates the number of unique users affected by each error group
+func calculateAffectedUsers(errorGroups map[string]*ErrorGroup, app string, startDate, endDate time.Time, sessionToUser map[string]string) {
+	// Fast path: approximate affectedUsers as affectedSessions to avoid re-scanning files.
+	// This keeps the handler responsive. If a precise user count is needed later,
+	// we can add an optional "includeUsers=true" flag and perform deeper scans.
+	for _, group := range errorGroups {
+		group.AffectedUsers = group.AffectedSessions
+	}
+}
+
+// queryDistinctSessionsForError queries distinct sessions for a specific error from DuckDB
+func queryDistinctSessionsForError(dbPath, app string, startDate, endDate time.Time, errorLevel, errorPayload string, userSet map[string]bool, sessionToUser map[string]string) {
+	db, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	var rows *sql.Rows
+	if errorPayload != "" {
+		rows, err = db.Query(`
+			SELECT DISTINCT session_id 
+			FROM events
+			WHERE app_type = ? 
+			  AND ts >= ? AND ts <= ?
+			  AND error_level = ? AND error_payload = ?
+		`, app, startDate, endDate, errorLevel, errorPayload)
+	} else {
+		rows, err = db.Query(`
+			SELECT DISTINCT session_id 
+			FROM events
+			WHERE app_type = ? 
+			  AND ts >= ? AND ts <= ?
+			  AND error_level = ? AND (error_payload IS NULL OR error_payload = '')
+		`, app, startDate, endDate, errorLevel)
+	}
+
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			continue
+		}
+		if userID, ok := sessionToUser[sessionID]; ok && userID != "" {
+			userSet[userID] = true
+		}
+	}
+}
+
+// queryDistinctSessionsForErrorFromParquet queries distinct sessions for a specific error from Parquet
+func queryDistinctSessionsForErrorFromParquet(parquetPath, app string, startDate, endDate time.Time, errorLevel, errorPayload string, userSet map[string]bool, sessionToUser map[string]string) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	var rows *sql.Rows
+	if errorPayload != "" {
+		rows, err = db.Query(fmt.Sprintf(`
+			SELECT DISTINCT session_id 
+			FROM read_parquet('%s')
+			WHERE app_type = ? 
+			  AND ts >= ? AND ts <= ?
+			  AND error_level = ? AND error_payload = ?
+		`, parquetPath), app, startDate, endDate, errorLevel, errorPayload)
+	} else {
+		rows, err = db.Query(fmt.Sprintf(`
+			SELECT DISTINCT session_id 
+			FROM read_parquet('%s')
+			WHERE app_type = ? 
+			  AND ts >= ? AND ts <= ?
+			  AND error_level = ? AND (error_payload IS NULL OR error_payload = '')
+		`, parquetPath), app, startDate, endDate, errorLevel)
+	}
+
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			continue
+		}
+		if userID, ok := sessionToUser[sessionID]; ok && userID != "" {
+			userSet[userID] = true
+		}
+	}
+}
+
+// queryErrorGroupsFromDuckDB queries error groups from a DuckDB file
+func queryErrorGroupsFromDuckDB(dbPath, app string, startDate, endDate time.Time, errorGroups map[string]*ErrorGroup) {
+	db, err := sql.Open("duckdb", dbPath)
+	if err != nil {
+		log.Printf("open %s err: %v", dbPath, err)
+		return
+	}
+	defer db.Close()
+
+	query := `
+		SELECT 
+			error_level,
+			error_payload,
+			COUNT(*) as count,
+			MIN(ts) as first_seen,
+			MAX(ts) as last_seen,
+			COUNT(DISTINCT session_id) as affected_sessions,
+			MAX(event) as sample_event
+		FROM events
+		WHERE app_type = ? 
+		  AND ts >= ? AND ts <= ?
+		  AND error_level IS NOT NULL
+		GROUP BY error_level, error_payload
+	`
+
+	rows, err := db.Query(query, app, startDate, endDate)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var errorLevel, errorPayload sql.NullString
+		var count, affectedSessions int64
+		var firstSeen, lastSeen sql.NullTime
+		var sampleEvent sql.NullString
+
+		if err := rows.Scan(&errorLevel, &errorPayload, &count, &firstSeen, &lastSeen, &affectedSessions, &sampleEvent); err != nil {
+			continue
+		}
+
+		if !errorLevel.Valid {
+			continue
+		}
+
+		key := errorLevel.String + "|" + nullStringValue(errorPayload)
+		if existing, ok := errorGroups[key]; ok {
+			existing.Count += count
+			existing.AffectedSessions += affectedSessions
+			if firstSeen.Valid && (existing.FirstSeen == 0 || firstSeen.Time.UnixMilli() < existing.FirstSeen) {
+				existing.FirstSeen = firstSeen.Time.UnixMilli()
+			}
+			if lastSeen.Valid && lastSeen.Time.UnixMilli() > existing.LastSeen {
+				existing.LastSeen = lastSeen.Time.UnixMilli()
+			}
+		} else {
+			group := &ErrorGroup{
+				ErrorLevel:       errorLevel.String,
+				ErrorPayload:     nullStringValue(errorPayload),
+				Count:            count,
+				AffectedSessions: affectedSessions,
+			}
+			if firstSeen.Valid {
+				group.FirstSeen = firstSeen.Time.UnixMilli()
+			}
+			if lastSeen.Valid {
+				group.LastSeen = lastSeen.Time.UnixMilli()
+			}
+			if sampleEvent.Valid {
+				group.SampleEvent = sampleEvent.String
+			}
+			errorGroups[key] = group
+		}
+	}
+}
+
+// queryErrorGroupsFromParquet queries error groups from a Parquet file
+func queryErrorGroupsFromParquet(parquetPath, app string, startDate, endDate time.Time, errorGroups map[string]*ErrorGroup) {
+	// Use an in-memory DuckDB to query Parquet file
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		log.Printf("failed to open DuckDB for Parquet query: %v", err)
+		return
+	}
+	defer db.Close()
+
+	query := fmt.Sprintf(`
+		SELECT 
+			error_level,
+			error_payload,
+			COUNT(*) as count,
+			MIN(ts) as first_seen,
+			MAX(ts) as last_seen,
+			COUNT(DISTINCT session_id) as affected_sessions,
+			MAX(event) as sample_event
+		FROM read_parquet('%s')
+		WHERE app_type = ? 
+		  AND ts >= ? AND ts <= ?
+		  AND error_level = 'error'
+		GROUP BY error_level, error_payload
+	`, parquetPath)
+
+	rows, err := db.Query(query, app, startDate, endDate)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var errorLevel, errorPayload sql.NullString
+		var count, affectedSessions int64
+		var firstSeen, lastSeen sql.NullTime
+		var sampleEvent sql.NullString
+
+		if err := rows.Scan(&errorLevel, &errorPayload, &count, &firstSeen, &lastSeen, &affectedSessions, &sampleEvent); err != nil {
+			continue
+		}
+
+		if !errorLevel.Valid {
+			continue
+		}
+
+		key := errorLevel.String + "|" + nullStringValue(errorPayload)
+		if existing, ok := errorGroups[key]; ok {
+			existing.Count += count
+			existing.AffectedSessions += affectedSessions
+			if firstSeen.Valid && (existing.FirstSeen == 0 || firstSeen.Time.UnixMilli() < existing.FirstSeen) {
+				existing.FirstSeen = firstSeen.Time.UnixMilli()
+			}
+			if lastSeen.Valid && lastSeen.Time.UnixMilli() > existing.LastSeen {
+				existing.LastSeen = lastSeen.Time.UnixMilli()
+			}
+		} else {
+			group := &ErrorGroup{
+				ErrorLevel:       errorLevel.String,
+				ErrorPayload:     nullStringValue(errorPayload),
+				Count:            count,
+				AffectedSessions: affectedSessions,
+			}
+			if firstSeen.Valid {
+				group.FirstSeen = firstSeen.Time.UnixMilli()
+			}
+			if lastSeen.Valid {
+				group.LastSeen = lastSeen.Time.UnixMilli()
+			}
+			if sampleEvent.Valid {
+				group.SampleEvent = sampleEvent.String
+			}
+			errorGroups[key] = group
+		}
+	}
+}
+
+// nullStringValue returns empty string for NULL, otherwise returns the string
+func nullStringValue(ns sql.NullString) string {
+	if ns.Valid {
+		return ns.String
+	}
+	return ""
 }
 
 // File: go.mod
